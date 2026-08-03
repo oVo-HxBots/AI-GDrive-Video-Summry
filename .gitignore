@@ -1,0 +1,26 @@
+# Ignore Python artifacts and outputs
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual env
+venv/
+.env
+.env.*
+
+# IDE/editor
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+
+# Output data
+output/
+
+# Pytest cache
+.pytest_cache/
+
+# Python logs
+*.log
