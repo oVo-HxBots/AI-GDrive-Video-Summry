@@ -641,4 +641,7 @@ def main():
                                  manifest_name=args.manifest, resume=args.resume, retry_failed=args.retry_failed,
                                  force=args.force, chunk_length_sec=args.chunk_length)
     succeeded = sum(1 for r in res if r.get("success"))
-    print(f"Done. {***
+    print(f"Done. {succeeded}/{len(res)} succeeded. Manifest at {os.path.join(args.workdir, args.manifest)}")
+
+if __name__ == "__main__":
+    main()
