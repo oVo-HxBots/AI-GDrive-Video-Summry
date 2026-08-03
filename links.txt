@@ -1,0 +1,6 @@
+# Example links file for the Drive video agent
+# Put one public Google Drive link or raw file id per line. Lines starting with # are ignored.
+
+# Example:
+# https://drive.google.com/file/d/1A2b3C4d5E6F7G8H9I0J/view?usp=sharing
+
