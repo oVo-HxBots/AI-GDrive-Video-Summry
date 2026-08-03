@@ -16,7 +16,7 @@ Features:
 Requirements:
  - ffmpeg and ffprobe in PATH
  - pip install requests python-pptx tqdm google-api-python-client google-auth
- - Set OMNIROUTE_API_BASE and OMNIROUTE_API_KEY in your environment
+ - Set OMNIROUTE_API_BASE (for chat/completions) and OMNIROUTE_API_KEY in your environment. Optionally set OMNIROUTE_AUDIO_BASE to route /v1/audio requests to a different host (for example: http://161.118.182.88:8084) while using the same API key.
  - For Drive API downloads: set GOOGLE_SERVICE_ACCOUNT_JSON to the path of a service account JSON file on the machine running the script,
    and share the Drive files/folders with the service account email.
 
@@ -53,6 +53,7 @@ except Exception:
 
 # ---------- config ----------
 OMNI_BASE = os.getenv("OMNIROUTE_API_BASE", "").rstrip("/")
+OMNI_AUDIO_BASE = os.getenv("OMNIROUTE_AUDIO_BASE", "").rstrip("/")  # optional separate base for /v1/audio endpoints
 OMNI_KEY = os.getenv("OMNIROUTE_API_KEY")
 MODEL_TRANSCRIBE = os.getenv("OMNIROUTE_MODEL_TRANSCRIBE", "whisper-1")
 MODEL_CHAT = os.getenv("OMNIROUTE_MODEL_CHAT", "gpt-4o-mini")
@@ -61,8 +62,8 @@ RETRY_BACKOFF_BASE = 1.5
 DEFAULT_MAX_WORKERS = int(os.getenv("OMNI_MAX_WORKERS", "3"))
 HEADERS = {"Authorization": f"Bearer {OMNI_KEY}"} if OMNI_KEY else {}
 
-if not OMNI_BASE or not OMNI_KEY:
-    logging.warning("OMNIROUTE_API_BASE or OMNIROUTE_API_KEY not set. HTTP calls will likely fail.")
+if not (OMNI_BASE or OMNI_AUDIO_BASE) or not OMNI_KEY:
+    logging.warning("OMNIROUTE_API_BASE (chat) or OMNIROUTE_AUDIO_BASE (audio) or OMNIROUTE_API_KEY may not be set. HTTP calls will likely fail if required values are missing.")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -238,9 +239,11 @@ def transcribe_chunk_with_timestamps(chunk_path: str, chunk_start_sec: float, mo
     """
     Returns list of segments: {"start": float, "end": float, "text": str}
     """
-    if not OMNI_BASE:
-        raise RuntimeError("OMNIROUTE_API_BASE not set")
-    url = OMNI_BASE + "/v1/audio/transcriptions"
+    # Use OMNIROUTE_AUDIO_BASE if provided, otherwise fall back to OMNIROUTE_API_BASE
+    base_for_audio = OMNI_AUDIO_BASE or OMNI_BASE
+    if not base_for_audio:
+        raise RuntimeError("OMNIROUTE_API_BASE or OMNIROUTE_AUDIO_BASE not set")
+    url = base_for_audio + "/v1/audio/transcriptions"
     with open(chunk_path, "rb") as f:
         files = {"file": (Path(chunk_path).name, f, "audio/wav")}
         data = {"model": model}
