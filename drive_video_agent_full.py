@@ -5,6 +5,7 @@ drive_video_agent_full.py
 Batch public-Google-Drive-video -> timestamped transcript -> structured report -> PPTX
 Features:
  - Public Drive downloader (fragile but simple)
+ - Optional Google Drive API download via service account (recommended for private files)
  - ffmpeg/ffprobe-based audio extraction and chunking (no pydub memory spikes)
  - Chunked transcription via OmniRoute/OpenAI-compatible /v1/audio/transcriptions
  - Timestamp-preserving segments when provider returns 'segments' (verbose_json)
@@ -14,8 +15,10 @@ Features:
 
 Requirements:
  - ffmpeg and ffprobe in PATH
- - pip install requests python-pptx tqdm
+ - pip install requests python-pptx tqdm google-api-python-client google-auth
  - Set OMNIROUTE_API_BASE and OMNIROUTE_API_KEY in your environment
+ - For Drive API downloads: set GOOGLE_SERVICE_ACCOUNT_JSON to the path of a service account JSON file on the machine running the script,
+   and share the Drive files/folders with the service account email.
 
 Usage:
     python drive_video_agent_full.py links.txt --workdir output --max-workers 3 --chunk-length 300
@@ -38,6 +41,15 @@ import requests
 from pptx import Presentation
 from pptx.util import Inches
 from tqdm import tqdm
+
+# Optional Google Drive API imports (only used when GOOGLE_SERVICE_ACCOUNT_JSON is set)
+try:
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaIoBaseDownload
+    GOOGLE_API_AVAILABLE = True
+except Exception:
+    GOOGLE_API_AVAILABLE = False
 
 # ---------- config ----------
 OMNI_BASE = os.getenv("OMNIROUTE_API_BASE", "").rstrip("/")
@@ -69,6 +81,33 @@ def get_drive_file_id(url_or_id: str) -> str:
     raise ValueError(f"Could not parse Drive file ID from: {url_or_id}")
 
 
+# ---------- Google Drive API (optional) ----------
+def download_with_drive_api(file_id: str, dest_path: str) -> str:
+    """
+    Use a service account JSON specified by GOOGLE_SERVICE_ACCOUNT_JSON to download a file.
+    Requires google-api-python-client and google-auth libraries. The service account or its domain
+    must have access to the file (share the file/folder with the service account email).
+    """
+    sa_path = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if not sa_path:
+        raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON not set; cannot use Drive API")
+    if not GOOGLE_API_AVAILABLE:
+        raise RuntimeError("google-api-python-client or google-auth not installed")
+    scopes = ["https://www.googleapis.com/auth/drive.readonly"]
+    creds = service_account.Credentials.from_service_account_file(sa_path, scopes=scopes)
+    service = build("drive", "v3", credentials=creds, cache_discovery=False)
+    meta = service.files().get(fileId=file_id, fields="id,name,mimeType,size").execute()
+    request = service.files().get_media(fileId=file_id)
+    with open(dest_path, "wb") as fh:
+        downloader = MediaIoBaseDownload(fh, request)
+        done = False
+        while not done:
+            status, done = downloader.next_chunk()
+            if status:
+                logging.debug(f"Download {int(status.progress() * 100)}%")
+    return dest_path
+
+
 # ---------- public Drive downloader (fragile) ----------
 def download_public_drive_file(file_id: str, dest_path: str, chunk_size: int = 32768, timeout: int = 60) -> str:
     """
@@ -92,6 +131,20 @@ def download_public_drive_file(file_id: str, dest_path: str, chunk_size: int = 3
             if chunk:
                 f.write(chunk)
     return dest_path
+
+def download_drive_file(file_id: str, dest_path: str) -> str:
+    """
+    Try Drive API if GOOGLE_SERVICE_ACCOUNT_JSON is set and google client libraries are available,
+    otherwise fall back to public downloader.
+    """
+    if os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON"):
+        try:
+            logging.info("Attempting download via Google Drive API (service account).")
+            return download_with_drive_api(file_id, dest_path)
+        except Exception as e:
+            logging.warning(f"Drive API download failed ({e}); falling back to public downloader.")
+    logging.info("Downloading via public Drive downloader (fragile).")
+    return download_public_drive_file(file_id, dest_path)
 
 
 # ---------- Run shell commands capturing stderr/stdout ----------
@@ -227,22 +280,40 @@ def chat_complete_raw(messages: List[Dict[str, str]], model: str = MODEL_CHAT, t
     except Exception:
         return resp.get("text", "")
 
+def chat_complete_json_with_retries(messages: List[Dict[str, str]], model: str = MODEL_CHAT, temperature: float = 0.1, max_tokens: int = 1200, attempts: int = 3) -> Any:
+    """
+    Call the chat completion and attempt to parse JSON. If the model doesn't return valid JSON, re-prompt up to `attempts` times.
+    Returns parsed JSON or {'_raw_text': raw} on final failure.
+    """
+    last_raw = None
+    for attempt in range(1, attempts + 1):
+        raw = chat_complete_raw(messages, model=model, temperature=temperature, max_tokens=max_tokens)
+        last_raw = raw
+        txt = raw.strip()
+        try:
+            return json.loads(txt)
+        except Exception:
+            import re
+            m = re.search(r"(\{[\s\S]*\}|\[[\s\S]*\])", txt)
+            if m:
+                try:
+                    return json.loads(m.group(1))
+                except Exception:
+                    logging.debug("Found JSON-like block but failed to parse on attempt %d", attempt)
+        if attempt < attempts:
+            # prepare a repair prompt
+            repair_msg = (
+                "The previous assistant reply was not valid JSON. Here is the reply:\n\n" + raw +
+                "\n\nPlease output ONLY valid JSON that matches the requested schema and nothing else. If you cannot, reply with an empty JSON object {}."
+            )
+            messages = messages + [{"role": "user", "content": repair_msg}]
+            logging.info("Re-prompting LLM for valid JSON (attempt %d/%d)", attempt+1, attempts)
+            time.sleep(1 + attempt)
+    return {"_raw_text": last_raw}
+
 def chat_complete_json(messages: List[Dict[str, str]], model: str = MODEL_CHAT, temperature: float = 0.1, max_tokens: int = 1200) -> Any:
-    raw = chat_complete_raw(messages, model=model, temperature=temperature, max_tokens=max_tokens)
-    txt = raw.strip()
-    # try direct JSON parse
-    try:
-        return json.loads(txt)
-    except Exception:
-        # attempt to find a JSON block inside text
-        import re
-        m = re.search(r"(\{[\s\S]*\}|\[[\s\S]*\])", txt)
-        if m:
-            try:
-                return json.loads(m.group(1))
-            except Exception:
-                logging.warning("Failed to parse JSON block from LLM output.")
-        return {"_raw_text": raw}
+    # Backwards-compatible wrapper that uses the retrying JSON parser
+    return chat_complete_json_with_retries(messages, model=model, temperature=temperature, max_tokens=max_tokens, attempts=3)
 
 
 # ---------- summarization prompts (JSON-enforcing) ----------
@@ -256,7 +327,6 @@ def summarize_chunk_omni_json(chunk: str) -> Any:
     user_prompt = "Here is a timestamped transcript chunk. Produce the JSON object described in the system prompt.\n\n" + chunk
     messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
     return chat_complete_json(messages, model=MODEL_CHAT, temperature=0.1, max_tokens=800)
-
 
 def combine_summaries_omni_json(summaries: List[Any]) -> Any:
     system = (
@@ -392,7 +462,7 @@ def process_drive_video(url_or_id: str, file_workdir: str, chunk_length_sec: int
         file_id = get_drive_file_id(url_or_id)
         video_path = os.path.join(file_workdir, f"{file_id}.mp4")
         logging.info(f"Downloading {file_id} -> {video_path}")
-        download_public_drive_file(file_id, video_path)
+        download_drive_file(file_id, video_path)
         # extract audio
         audio_path = os.path.join(file_workdir, f"{file_id}.wav")
         logging.info(f"Extracting audio to {audio_path}")
@@ -542,5 +612,33 @@ def process_multiple_links(links: List[str], workdir: str = "output", max_worker
                 "srt": res.get("srt",""),
                 "report": res.get("report",""),
                 "pptx": res.get("pptx",""),
-                "error": res.get("error",""
-],
+                "error": res.get("error",""),
+            }
+            write_manifest_row(manifest_path, row, manifest_fieldnames)
+    progress.close()
+    return results
+
+
+# ---------- CLI ----------
+def main():
+    parser = argparse.ArgumentParser(description="Batch Drive video -> transcript -> summary -> PPTX (OmniRoute/OpenAI-compatible)")
+    parser.add_argument("links_file", help="Text file with Drive links or IDs, one per line")
+    parser.add_argument("--workdir", default="output", help="Output workdir")
+    parser.add_argument("--max-workers", type=int, default=DEFAULT_MAX_WORKERS, help="Concurrent workers")
+    parser.add_argument("--chunk-length", type=int, default=300, help="Audio chunk length in seconds (default 300)")
+    parser.add_argument("--manifest", default="manifest.csv", help="Manifest CSV filename inside workdir")
+    parser.add_argument("--resume", action="store_true", help="Skip items already marked success in manifest")
+    parser.add_argument("--retry-failed", action="store_true", help="Only retry items marked failed in manifest")
+    parser.add_argument("--force", action="store_true", help="Force reprocess all items regardless of manifest")
+    args = parser.parse_args()
+
+    links = read_links_file(args.links_file)
+    if not links:
+        print("No links found in", args.links_file)
+        sys.exit(1)
+    print(f"Processing {len(links)} links -> {args.workdir} with {args.max_workers} workers. Manifest: {args.manifest}")
+    res = process_multiple_links(links, workdir=args.workdir, max_workers=args.max_workers,
+                                 manifest_name=args.manifest, resume=args.resume, retry_failed=args.retry_failed,
+                                 force=args.force, chunk_length_sec=args.chunk_length)
+    succeeded = sum(1 for r in res if r.get("success"))
+    print(f"Done. {***
